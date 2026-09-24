@@ -365,8 +365,38 @@ impl FlatCache {
 // Pretokens longer than 15 bytes (rare in natural text) are not cached here;
 // they take the merge path directly.
 const PRETOKEN_CACHE_MIN_BITS: usize = 12;
-const PRETOKEN_CACHE_MAX_BITS: usize = 21; // ~2M entries × 32 B = 64 MiB cap
+// Default per-thread fused-cache cap: 2^18 entries × 32 B = 8 MiB. Absolute
+// ceiling 2^21 (64 MiB) for hosts that explicitly opt into a larger cache.
+const PRETOKEN_CACHE_MAX_BITS_DEFAULT: usize = 18;
+const PRETOKEN_CACHE_HARD_MAX_BITS: usize = 21;
 const PT_INLINE: usize = 3;
+
+/// Power-of-two entry cap for the fused-pretoken cache, resolved once from the
+/// environment.
+///
+/// The fused cache ([`TL_FUSED_CACHE`]) is thread-local: every worker thread
+/// that tokenizes grows its own copy up to this cap. A host that fans
+/// tokenization across many threads (e.g. one thread pool per loaded tokenizer)
+/// therefore multiplies the cap by the live thread count — at the previous fixed
+/// 2^21 (64 MiB) a process with a few hundred worker threads pinned tens of GiB
+/// of mostly-idle cache. Default to 8 MiB and let the host tune it via
+/// `FASTOKENS_PRETOKEN_CACHE_MAX_BITS` (clamped to `[MIN, HARD_MAX]`).
+fn resolve_pretoken_cache_max_bits(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(PRETOKEN_CACHE_MAX_BITS_DEFAULT)
+        .clamp(PRETOKEN_CACHE_MIN_BITS, PRETOKEN_CACHE_HARD_MAX_BITS)
+}
+
+fn pretoken_cache_max_bits() -> usize {
+    static BITS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BITS.get_or_init(|| {
+        resolve_pretoken_cache_max_bits(
+            std::env::var("FASTOKENS_PRETOKEN_CACHE_MAX_BITS")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
 
 /// Prefetch the cache line at `p` into L1 (read hint). No memory effects, so
 /// any address is safe; a no-op on architectures without a prefetch intrinsic.
@@ -613,7 +643,7 @@ impl PretokenCache {
 
     #[cold]
     fn grow_or_clear(&mut self) {
-        if self.cap >= (1usize << PRETOKEN_CACHE_MAX_BITS) {
+        if self.cap >= (1usize << pretoken_cache_max_bits()) {
             self.clear();
             return;
         }
@@ -2076,6 +2106,31 @@ mod tests {
     fn empty_input() {
         let bpe = test_bpe();
         assert_eq!(bpe.tokenize("").unwrap(), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn pretoken_cache_max_bits_resolves_and_clamps() {
+        // Unset -> the 8 MiB default.
+        assert_eq!(
+            resolve_pretoken_cache_max_bits(None),
+            PRETOKEN_CACHE_MAX_BITS_DEFAULT
+        );
+        // Explicit in-range value is honored (host shrinking the per-thread cap).
+        assert_eq!(resolve_pretoken_cache_max_bits(Some("16")), 16);
+        // Out-of-range clamps to the hard bounds rather than under/over-allocating.
+        assert_eq!(
+            resolve_pretoken_cache_max_bits(Some("99")),
+            PRETOKEN_CACHE_HARD_MAX_BITS
+        );
+        assert_eq!(
+            resolve_pretoken_cache_max_bits(Some("1")),
+            PRETOKEN_CACHE_MIN_BITS
+        );
+        // Garbage falls back to the default.
+        assert_eq!(
+            resolve_pretoken_cache_max_bits(Some("not-a-number")),
+            PRETOKEN_CACHE_MAX_BITS_DEFAULT
+        );
     }
 
     #[test]
